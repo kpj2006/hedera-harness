@@ -164,7 +164,7 @@ export async function abortOnInfrastructureFailure(input: {
   });
   await appendHarnessNote(
     layout.notesLogPath,
-    `Attempt ${attempt} evaluation infrastructure abort`,
+    `Attempt ${attempt} infrastructure abort`,
     [
       "Repair loop aborted: failure is harness/agent tooling, not the generated app.",
       reason,
@@ -173,7 +173,9 @@ export async function abortOnInfrastructureFailure(input: {
       ),
     ].join("\n"),
   );
-  logPhase("Aborting repair loop after evaluation infrastructure failure", reason);
+  // Reason-agnostic: this path now also covers a rejected agent rate limit,
+  // which is infrastructure but has nothing to do with the evaluator.
+  logPhase("Aborting repair loop after an infrastructure failure", reason);
 }
 
 export async function checkpoint(input: {

@@ -7,9 +7,13 @@ import { makeOsTempDir } from "./tmpDir.mjs";
 const { AgentStreamLogger, readEventTelemetry, mergeTelemetry, summarizeStreamEvent } =
   await import(pathToFileURL(path.resolve("dist/agentStreamLogger.js")).href);
 
-const { accumulateUsage, emptyUsageTotals, formatAgentUsage, rateLimitAbortReason } = await import(
-  pathToFileURL(path.resolve("dist/agentUsage.js")).href
-);
+const {
+  accumulateUsage,
+  emptyUsageTotals,
+  formatAgentUsage,
+  rateLimitAbort,
+  rateLimitAbortReason,
+} = await import(pathToFileURL(path.resolve("dist/agentUsage.js")).href);
 
 const { formatRunOutro } = await import(pathToFileURL(path.resolve("dist/runOutro.js")).href);
 
@@ -116,6 +120,52 @@ test("only a rejected rate limit aborts the loop", () => {
   });
   assert.match(reason, /rate limit rejected \(five_hour, resets 2026-09-/);
   assert.match(reason, /cannot succeed until it resets/);
+});
+
+test("a passing attempt never aborts, even when the agent hit its rate limit", () => {
+  const rejected = { rateLimit: { status: "rejected", rateLimitType: "five_hour" } };
+
+  // The work is delivered and the loop is about to stop anyway. Aborting here
+  // would print an infrastructure abort directly under an "Attempt 1 PASSED".
+  assert.equal(
+    rateLimitAbort({
+      passed: true,
+      evaluationInfrastructureFailure: false,
+      generatorTelemetry: rejected,
+    }),
+    undefined,
+  );
+
+  assert.ok(
+    rateLimitAbort({
+      passed: false,
+      evaluationInfrastructureFailure: false,
+      generatorTelemetry: rejected,
+    }),
+    "a failing attempt with a rejected limit must stop the loop",
+  );
+});
+
+test("an evaluation infrastructure failure keeps its own, more specific reason", () => {
+  assert.equal(
+    rateLimitAbort({
+      passed: false,
+      evaluationInfrastructureFailure: true,
+      generatorTelemetry: { rateLimit: { status: "rejected" } },
+    }),
+    undefined,
+  );
+});
+
+test("the evaluator's rate limit aborts when the generator's is clean", () => {
+  assert.ok(
+    rateLimitAbort({
+      passed: false,
+      evaluationInfrastructureFailure: false,
+      generatorTelemetry: { rateLimit: { status: "allowed" } },
+      evaluatorTelemetry: { rateLimit: { status: "rejected", rateLimitType: "seven_day" } },
+    }),
+  );
 });
 
 // ── Run totals ───────────────────────────────────────────────────────────────

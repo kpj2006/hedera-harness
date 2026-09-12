@@ -92,6 +92,29 @@ export function rateLimitAbortReason(
   return `agent rate limit rejected${formatWindow(rateLimit)} — further attempts cannot succeed until it resets`;
 }
 
+/**
+ * Whether a rate limit should stop the loop, and why.
+ *
+ * Two things never abort for a rate limit. A passing attempt has nothing left
+ * to abort — the work is delivered, and the limit only bars attempts that would
+ * have followed; reporting an infrastructure abort there would contradict the
+ * PASSED verdict printed a line earlier. And an evaluation infrastructure
+ * failure already owns the abort, with a more specific reason than this one.
+ */
+export function rateLimitAbort(input: {
+  passed: boolean;
+  evaluationInfrastructureFailure: boolean;
+  generatorTelemetry?: AgentTelemetry;
+  evaluatorTelemetry?: AgentTelemetry;
+}): string | undefined {
+  if (input.passed || input.evaluationInfrastructureFailure) return undefined;
+
+  return (
+    rateLimitAbortReason(input.generatorTelemetry) ??
+    rateLimitAbortReason(input.evaluatorTelemetry)
+  );
+}
+
 function formatWindow(rateLimit: RateLimitSnapshot): string {
   const window = rateLimit.rateLimitType ? ` (${rateLimit.rateLimitType}` : "";
   if (!window) return "";

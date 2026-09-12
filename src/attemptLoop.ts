@@ -10,7 +10,7 @@ import {
 } from "./promptBuilder.js";
 import { appendHarnessNote, type RunLayout } from "./runArtifacts.js";
 import { runGenerateStage, runValidationStages, type AttemptStageContext } from "./attemptStages.js";
-import { accumulateUsage, emptyUsageTotals, rateLimitAbortReason } from "./agentUsage.js";
+import { accumulateUsage, emptyUsageTotals, rateLimitAbort } from "./agentUsage.js";
 import {
   announceAttempt,
   attemptKind,
@@ -208,17 +208,21 @@ export async function runAttemptLoop(input: AttemptLoopInput): Promise<RunReport
     // A rejected rate limit is infrastructure, like an unreachable MCP browser:
     // the remaining attempts would fail identically and be reported as if the
     // generated app were at fault.
-    const infrastructureAbort = validation.evaluation?.infrastructureFailure
-      ? undefined
-      : (rateLimitAbortReason(generate.agentResult.telemetry) ??
-        rateLimitAbortReason(validation.evaluation?.telemetry));
+    const evaluationAbort = validation.evaluation?.infrastructureFailure === true;
+    const limitAbort = rateLimitAbort({
+      passed: validation.passed,
+      evaluationInfrastructureFailure: evaluationAbort,
+      generatorTelemetry: generate.agentResult.telemetry,
+      evaluatorTelemetry: validation.evaluation?.telemetry,
+    });
 
-    if (validation.evaluation?.infrastructureFailure || infrastructureAbort) {
+    if (evaluationAbort || limitAbort) {
       await abortOnInfrastructureFailure({
         layout,
         attempt: attempts,
         validation,
-        reason: infrastructureAbort,
+        // Undefined falls back to the evaluation's own, more specific reason.
+        reason: limitAbort,
       });
       await checkpoint({ layout, commitAttempt, workspacePath, attempt: attempts, validation });
       break;
