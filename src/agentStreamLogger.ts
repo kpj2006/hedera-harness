@@ -1,4 +1,5 @@
 import { appendFile, writeFile } from "node:fs/promises";
+import type { AgentTelemetry, RateLimitSnapshot } from "./types.js";
 
 export interface AgentProgress {
   lastActivity: string;
@@ -14,6 +15,12 @@ export class AgentStreamLogger {
     toolCallsStarted: 0,
     toolCallsCompleted: 0,
   };
+  /**
+   * Accumulated across the stream rather than read from the final event alone:
+   * an agent killed on a timeout never emits its `result`, but the rate-limit
+   * envelope that explains why it stalled has usually already gone past.
+   */
+  private telemetry: AgentTelemetry = {};
 
   constructor(
     private readonly activityLogPath: string,
@@ -30,6 +37,10 @@ export class AgentStreamLogger {
 
   getProgress(): AgentProgress {
     return { ...this.progress };
+  }
+
+  getTelemetry(): AgentTelemetry {
+    return { ...this.telemetry };
   }
 
   async processChunk(chunk: string): Promise<void> {
@@ -53,10 +64,12 @@ export class AgentStreamLogger {
     }
 
     // Captured before the early return: events that carry no activity summary
-    // (Claude opens a stream with `rate_limit_event`) still name the session.
+    // (Claude opens a stream with `rate_limit_event`) still name the session
+    // and carry the spend and rate-limit state worth keeping.
     if (typeof event.session_id === "string") {
       this.progress.sessionId = event.session_id;
     }
+    this.telemetry = mergeTelemetry(this.telemetry, readEventTelemetry(event));
 
     const summarized = summarizeStreamEvent(event);
     if (!summarized) return;
@@ -132,7 +145,25 @@ export function summarizeStreamEvent(
     return { summary: "THINKING completed" };
   }
 
+  // Logged only when it is news. Claude emits this envelope continuously, and a
+  // healthy `allowed` on every turn would bury the activity log.
+  if (type === "rate_limit_event") {
+    const rateLimit = readRateLimit(event);
+    if (!rateLimit || rateLimit.status === "allowed") return null;
+    return { summary: `RATE LIMIT ${formatRateLimit(rateLimit)}` };
+  }
+
   return null;
+}
+
+/** Human-readable rate-limit state, e.g. `rejected five_hour, resets 14:05:00Z`. */
+export function formatRateLimit(rateLimit: RateLimitSnapshot): string {
+  const window = rateLimit.rateLimitType ? ` ${rateLimit.rateLimitType}` : "";
+  const resets =
+    typeof rateLimit.resetsAt === "number" && Number.isFinite(rateLimit.resetsAt)
+      ? `, resets ${new Date(rateLimit.resetsAt * 1000).toISOString()}`
+      : "";
+  return `${rateLimit.status}${window}${resets}`;
 }
 
 /** Cursor CLI: one event per tool call, payload keyed `<name>ToolCall`. */
@@ -270,6 +301,89 @@ function describeClaudeToolUse(block: Record<string, unknown>): string {
   }
 
   return `${name} ${truncate(JSON.stringify(input), 120)}`;
+}
+
+/**
+ * Pull spend and rate-limit state out of an event, if it carries any.
+ *
+ * Both CLIs put the run totals on the terminal `result` event, so this is a
+ * read of what the agent already reports rather than an accounting of our own.
+ * A CLI that reports nothing yields `{}` and the run simply has no cost line.
+ */
+export function readEventTelemetry(event: Record<string, unknown>): AgentTelemetry {
+  const telemetry: AgentTelemetry = {};
+
+  if (event.type === "system" && event.subtype === "init" && typeof event.model === "string") {
+    telemetry.model = event.model;
+  }
+
+  if (event.type === "rate_limit_event") {
+    const rateLimit = readRateLimit(event);
+    if (rateLimit) telemetry.rateLimit = rateLimit;
+  }
+
+  if (event.type !== "result") return telemetry;
+
+  if (typeof event.total_cost_usd === "number" && Number.isFinite(event.total_cost_usd)) {
+    telemetry.costUsd = event.total_cost_usd;
+  }
+  if (typeof event.num_turns === "number" && Number.isFinite(event.num_turns)) {
+    telemetry.numTurns = event.num_turns;
+  }
+
+  const usage =
+    event.usage && typeof event.usage === "object"
+      ? (event.usage as Record<string, unknown>)
+      : undefined;
+  if (usage) {
+    const input = readFiniteNumber(usage.input_tokens);
+    const output = readFiniteNumber(usage.output_tokens);
+    const cacheRead = readFiniteNumber(usage.cache_read_input_tokens);
+    const cacheCreation = readFiniteNumber(usage.cache_creation_input_tokens);
+
+    if (input !== undefined) telemetry.inputTokens = input;
+    if (output !== undefined) telemetry.outputTokens = output;
+    if (cacheRead !== undefined) telemetry.cacheReadInputTokens = cacheRead;
+    if (cacheCreation !== undefined) telemetry.cacheCreationInputTokens = cacheCreation;
+  }
+
+  return telemetry;
+}
+
+/** Later non-empty fields win; the terminal `result` therefore beats earlier guesses. */
+export function mergeTelemetry(base: AgentTelemetry, next: AgentTelemetry): AgentTelemetry {
+  const merged: AgentTelemetry = { ...base };
+  for (const [key, value] of Object.entries(next)) {
+    if (value !== undefined) {
+      (merged as Record<string, unknown>)[key] = value;
+    }
+  }
+  return merged;
+}
+
+function readRateLimit(event: Record<string, unknown>): RateLimitSnapshot | null {
+  const info = event.rate_limit_info;
+  if (!info || typeof info !== "object") return null;
+
+  const record = info as Record<string, unknown>;
+  const status = record.status;
+  if (status !== "allowed" && status !== "allowed_warning" && status !== "rejected") {
+    return null;
+  }
+
+  return {
+    status,
+    ...(typeof record.rateLimitType === "string"
+      ? { rateLimitType: record.rateLimitType }
+      : {}),
+    ...(readFiniteNumber(record.resetsAt) !== undefined
+      ? { resetsAt: readFiniteNumber(record.resetsAt) }
+      : {}),
+  };
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 /** Content blocks of a Claude `assistant`/`user` event, or `[]` for any other shape. */

@@ -10,6 +10,7 @@ import {
 } from "./promptBuilder.js";
 import { appendHarnessNote, type RunLayout } from "./runArtifacts.js";
 import { runGenerateStage, runValidationStages, type AttemptStageContext } from "./attemptStages.js";
+import { accumulateUsage, emptyUsageTotals, rateLimitAbortReason } from "./agentUsage.js";
 import {
   announceAttempt,
   attemptKind,
@@ -140,6 +141,7 @@ export async function runAttemptLoop(input: AttemptLoopInput): Promise<RunReport
   let openFindingIds = input.previousOpenFindingIds ?? [];
   let previousFindings: ValidationFinding[] = [];
   let delta: FindingDelta = { open: openFindingIds, fixed: [], introduced: [] };
+  let agentUsage = emptyUsageTotals();
 
   while (attemptsThisCycle < maxAttempts) {
     attempts += 1;
@@ -193,6 +195,9 @@ export async function runAttemptLoop(input: AttemptLoopInput): Promise<RunReport
 
     validation = await runValidationStages(context, generate.finding);
 
+    agentUsage = accumulateUsage(agentUsage, generate.agentResult.telemetry);
+    agentUsage = accumulateUsage(agentUsage, validation.evaluation?.telemetry);
+
     delta = computeFindingDelta(openFindingIds, validation.findings);
     validation.findings = applyFindingStatus(validation.findings, delta, previousFindings);
     previousFindings = validation.findings;
@@ -200,8 +205,21 @@ export async function runAttemptLoop(input: AttemptLoopInput): Promise<RunReport
 
     await recordAttemptResult({ layout, attempt: attempts, validation, delta });
 
-    if (validation.evaluation?.infrastructureFailure) {
-      await abortOnInfrastructureFailure({ layout, attempt: attempts, validation });
+    // A rejected rate limit is infrastructure, like an unreachable MCP browser:
+    // the remaining attempts would fail identically and be reported as if the
+    // generated app were at fault.
+    const infrastructureAbort = validation.evaluation?.infrastructureFailure
+      ? undefined
+      : (rateLimitAbortReason(generate.agentResult.telemetry) ??
+        rateLimitAbortReason(validation.evaluation?.telemetry));
+
+    if (validation.evaluation?.infrastructureFailure || infrastructureAbort) {
+      await abortOnInfrastructureFailure({
+        layout,
+        attempt: attempts,
+        validation,
+        reason: infrastructureAbort,
+      });
       await checkpoint({ layout, commitAttempt, workspacePath, attempt: attempts, validation });
       break;
     }
@@ -246,6 +264,7 @@ export async function runAttemptLoop(input: AttemptLoopInput): Promise<RunReport
     startedAt,
     validation,
     delta,
+    agentUsage,
   });
 }
 
